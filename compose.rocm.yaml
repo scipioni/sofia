@@ -1,0 +1,37 @@
+# AMD / ROCm overlay.
+#
+#   docker compose -f compose.yaml -f compose.rocm.yaml up --build
+#
+# Requires the ROCm kernel driver (amdgpu + ROCk) on the host. Verify with:
+#   docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+#     rocm/rocm-terminal rocm-smi
+#
+# Notes:
+#  * `group_add` must match the host's GIDs for the video/render groups. Group
+#    *names* only resolve if those groups exist inside the container; if the GPU
+#    comes back invisible, run `getent group render video` on the host and put the
+#    numeric GIDs here instead.
+#  * On an unsupported-but-capable card, set HSA_OVERRIDE_GFX_VERSION (e.g.
+#    "10.3.0" for RDNA2 consumer parts) to make ROCm treat it as a known target.
+
+services:
+  stt: &rocm
+    build:
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/rocm6.2
+    image: sofia-galileo/audio:rocm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp:unconfined
+    # ROCm uses large shared-memory segments for its host/device transfers.
+    ipc: host
+    shm_size: "8gb"
+    environment:
+      HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
+
+  tts: *rocm

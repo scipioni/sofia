@@ -1,0 +1,135 @@
+# go-task task runner — https://taskfile.dev
+#
+#   task            list every task
+#   task up:rocm    build and run the stack on an AMD GPU
+#
+# Anything after `--` is passed through, e.g. `task test -- -k realtime -v`.
+version: "3"
+
+silent: true
+
+vars:
+  COMPOSE: docker compose -f compose.yaml
+  QAA_URL: http://localhost:8000
+  TTS_URL: http://localhost:8200
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  # ------------------------------------------------------------------ local ---
+
+  setup:
+    desc: Create a local venv with every extra installed
+    cmds:
+      - uv venv
+      - uv pip install -e '.[s2s,qaa,audio,dev]'
+    sources:
+      - pyproject.toml
+    generates:
+      - .venv/pyvenv.cfg
+
+  lint:
+    desc: Ruff check + format check
+    cmds:
+      - uv run ruff check src tests
+      - uv run ruff format --check src tests
+
+  fmt:
+    desc: Autoformat and autofix
+    cmds:
+      - uv run ruff check --fix src tests
+      - uv run ruff format src tests
+
+  test:
+    desc: Run the test suite (task test -- -k realtime -v)
+    cmds:
+      - uv run pytest {{.CLI_ARGS | default "-q"}}
+
+  check:
+    desc: Everything CI would run
+    cmds:
+      - task: lint
+      - task: test
+
+  # ----------------------------------------------------------------- docker ---
+
+  up:nvidia:
+    desc: Build and run the whole stack on an NVIDIA GPU
+    cmds:
+      - task: _up
+        vars: { OVERLAY: "-f compose.nvidia.yaml" }
+
+  up:rocm:
+    desc: Build and run the whole stack on an AMD GPU
+    cmds:
+      - task: _up
+        vars: { OVERLAY: "-f compose.rocm.yaml" }
+
+  up:cpu:
+    desc: Build and run on CPU (slower, but needs no GPU at all)
+    cmds:
+      - task: _up
+        vars: { OVERLAY: "" }
+
+  _up:
+    internal: true
+    cmds:
+      - "{{.COMPOSE}} {{.OVERLAY}} up --build"
+
+  down:
+    desc: Stop everything
+    cmds:
+      - "{{.COMPOSE}} down"
+
+  logs:
+    desc: Follow logs (task logs -- s2s)
+    cmds:
+      - "{{.COMPOSE}} logs -f {{.CLI_ARGS}}"
+
+  config:
+    desc: Validate every compose file combination
+    # Placeholders satisfy the `:?` guards in compose.yaml, so this checks the
+    # file structure without needing a real .env.
+    env:
+      LIVEKIT_URL: ws://placeholder
+      LIVEKIT_API_KEY: placeholder
+      LIVEKIT_API_SECRET: placeholder
+      SOFIA_QAA_LLM_BASE_URL: http://placeholder/v1
+      SOFIA_QAA_LLM_MODEL: placeholder
+    cmds:
+      - for: ["", "-f compose.nvidia.yaml", "-f compose.rocm.yaml"]
+        cmd: "{{.COMPOSE}} {{.ITEM}} config -q && echo 'ok: compose.yaml {{.ITEM}}'"
+
+  # ----------------------------------------------------------------- probes ---
+
+  console:
+    desc: Talk to the agent from your terminal, no LiveKit room needed
+    cmds:
+      - uv run sofia-s2s console
+
+  ask:
+    desc: Ask the brain one question over HTTP (task ask Q="che ore sono?")
+    vars:
+      Q: '{{.Q | default "who are you?"}}'
+    cmds:
+      - |
+        curl -sS {{.QAA_URL}}/v1/chat/completions \
+          -H 'content-type: application/json' \
+          -d '{"model":"sofia-qaa","messages":[{"role":"user","content":"{{.Q}}"}]}' \
+          | python3 -m json.tool
+
+  say:
+    desc: Synthesise a sentence to out.wav (task say T="ciao")
+    vars:
+      T: '{{.T | default "Hello from Sofia."}}'
+      VOICE: '{{.VOICE | default "af_heart"}}'
+    cmds:
+      - |
+        curl -sS {{.TTS_URL}}/v1/audio/speech \
+          -H 'content-type: application/json' \
+          -d '{"model":"kokoro","input":"{{.T}}","voice":"{{.VOICE}}","response_format":"wav"}' \
+          -o out.wav
+      - echo "wrote out.wav"

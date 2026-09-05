@@ -1,0 +1,132 @@
+# Base topology. Defaults to CPU inference so it runs anywhere.
+# Pick an accelerator by layering an overlay on top:
+#
+#   docker compose -f compose.yaml -f compose.nvidia.yaml up --build
+#   docker compose -f compose.yaml -f compose.rocm.yaml   up --build
+#
+# (or just `task up:nvidia` / `task up:rocm`)
+name: sofia-galileo
+
+services:
+  # ---------------------------------------------------------------- the brain
+  qaa-agent:
+    build:
+      context: .
+      dockerfile: docker/qaa.Dockerfile
+    image: sofia-galileo/qaa-agent:local
+    restart: unless-stopped
+    environment:
+      SOFIA_QAA_PORT: 8000
+      SOFIA_QAA_LOG_LEVEL: ${SOFIA_LOG_LEVEL:-INFO}
+      # Your OpenAI-compatible LLM. host.docker.internal reaches a server running
+      # on the host; use a URL or a compose service name for anything else.
+      SOFIA_QAA_LLM_BASE_URL: ${SOFIA_QAA_LLM_BASE_URL:?set your OpenAI-compatible LLM endpoint}
+      SOFIA_QAA_LLM_API_KEY: ${SOFIA_QAA_LLM_API_KEY:-not-needed}
+      SOFIA_QAA_LLM_MODEL: ${SOFIA_QAA_LLM_MODEL:?set the upstream model name}
+      SOFIA_QAA_SERVED_MODEL_NAME: sofia-qaa
+      SOFIA_QAA_MAX_TOKENS: ${SOFIA_QAA_MAX_TOKENS:-320}
+      SOFIA_QAA_TEMPERATURE: ${SOFIA_QAA_TEMPERATURE:-0.6}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Exposed on loopback only — handy for `curl`, not meant for the network.
+      - "127.0.0.1:8000:8000"
+    networks: [sofia]
+
+  # ------------------------------------------------------------ speech to text
+  stt:
+    build:
+      context: .
+      dockerfile: docker/audio.Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: sofia-galileo/audio:${ACCEL:-cpu}
+    command: ["sofia-stt"]
+    restart: unless-stopped
+    environment:
+      SOFIA_STT_PORT: 8100
+      SOFIA_STT_LOG_LEVEL: ${SOFIA_LOG_LEVEL:-INFO}
+      # batch (Whisper) | streaming (sherpa-onnx) | both
+      SOFIA_STT_BACKEND: ${SOFIA_STT_BACKEND:-both}
+      # nemotron (default) or whisper — must match SOFIA_STT_MODEL_ID
+      SOFIA_STT_BATCH_ENGINE: ${SOFIA_STT_BATCH_ENGINE:-nemotron}
+      SOFIA_STT_MODEL_ID: ${SOFIA_STT_MODEL_ID:-nvidia/nemotron-3.5-asr-streaming-0.6b}
+      SOFIA_STT_DEFAULT_LANGUAGE: ${SOFIA_LANGUAGE:-en}
+      SOFIA_STT_DEVICE: ${SOFIA_AUDIO_DEVICE:-auto}
+      SOFIA_STT_SHERPA_MODEL_URL: ${SOFIA_STT_SHERPA_MODEL_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2}
+      SOFIA_STT_SHERPA_RULE2_MIN_TRAILING_SILENCE: ${SOFIA_STT_ENDPOINT_SILENCE:-0.8}
+    volumes:
+      - hf-cache:/home/sofia/.cache/huggingface
+      - models:/home/sofia/models
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8100/healthz"]
+      interval: 15s
+      timeout: 5s
+      # Generous: the first boot downloads model weights (~1.3 GB for Nemotron).
+      start_period: 600s
+      retries: 5
+    networks: [sofia]
+
+  # ------------------------------------------------------------ text to speech
+  tts:
+    build:
+      context: .
+      dockerfile: docker/audio.Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: sofia-galileo/audio:${ACCEL:-cpu}
+    command: ["sofia-tts"]
+    restart: unless-stopped
+    environment:
+      SOFIA_TTS_PORT: 8200
+      SOFIA_TTS_LOG_LEVEL: ${SOFIA_LOG_LEVEL:-INFO}
+      SOFIA_TTS_DEFAULT_VOICE: ${SOFIA_TTS_VOICE:-af_heart}
+      SOFIA_TTS_DEVICE: ${SOFIA_AUDIO_DEVICE:-auto}
+    volumes:
+      - hf-cache:/home/sofia/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8200/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 300s
+      retries: 5
+    networks: [sofia]
+
+  # ------------------------------------------------------- the LiveKit worker
+  s2s:
+    build:
+      context: .
+      dockerfile: docker/s2s.Dockerfile
+    image: sofia-galileo/s2s:local
+    restart: unless-stopped
+    environment:
+      LIVEKIT_URL: ${LIVEKIT_URL:?set your LiveKit server URL}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set your LiveKit API key}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set your LiveKit API secret}
+
+      SOFIA_S2S_LOG_LEVEL: ${SOFIA_LOG_LEVEL:-INFO}
+      SOFIA_S2S_LANGUAGE: ${SOFIA_LANGUAGE:-en}
+      SOFIA_S2S_AGENT_NAME: ${SOFIA_S2S_AGENT_NAME:-}
+
+      SOFIA_S2S_QAA_BASE_URL: http://qaa-agent:8000/v1
+      SOFIA_S2S_STT_BASE_URL: http://stt:8100/v1
+      # true -> streaming ASR over ws://stt:8100/v1/realtime
+      SOFIA_S2S_STT_USE_REALTIME: ${SOFIA_STT_STREAMING:-false}
+      SOFIA_S2S_TTS_BASE_URL: http://tts:8200/v1
+      SOFIA_S2S_TTS_VOICE: ${SOFIA_TTS_VOICE:-af_heart}
+    depends_on:
+      stt:
+        condition: service_healthy
+      tts:
+        condition: service_healthy
+      qaa-agent:
+        condition: service_healthy
+    networks: [sofia]
+
+networks:
+  sofia:
+    driver: bridge
+
+volumes:
+  hf-cache:
+  models:
