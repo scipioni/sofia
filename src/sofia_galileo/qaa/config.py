@@ -21,6 +21,9 @@ class QaaSettings(BaseSettings):
     port: int = 8000
     log_level: str = "INFO"
     json_logs: bool = True
+    # Dev only: see audio/config.py's SttSettings.reload — same mechanism, same
+    # requirements (an editable install, docker/qaa.Dockerfile's DEV build arg).
+    reload: bool = False
 
     # Upstream OpenAI-compatible LLM (vLLM, llama.cpp, Ollama, TGI, hosted API…).
     llm_base_url: str = "http://host.docker.internal:8000/v1"

@@ -15,6 +15,7 @@ task test                        # pytest -q
 task test -- -k realtime -v      # anything after `--` is passed through
 task config                      # `docker compose config -q` for all three overlays
 task up:rocm | up:nvidia | up:cpu   # build and run the stack
+task up:rocm:dev | up:nvidia:dev | up:cpu:dev   # same, + compose.dev.yaml hot reload
 task down                        # stop
 task logs -- s2s                 # follow one service's logs
 ```

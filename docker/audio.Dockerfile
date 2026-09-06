@@ -149,7 +149,18 @@ COPY --from=rocrand-headers /usr/local/include/ /usr/local/include/
 
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN uv pip install --system --no-cache '.[audio]'
+# DEV=true installs editable instead: the package's .pth then points at this
+# same /app path, so a compose.dev.yaml bind mount of ./src over /app/src
+# later is what actually gets (re-)imported — including by uvicorn's own
+# reload watcher (SttSettings.reload / TtsSettings.reload) — with no reinstall
+# needed at container start. False (default) is the production, immutable
+# install this image has always done.
+ARG DEV=false
+RUN if [ "$DEV" = "true" ]; then \
+        uv pip install --system --no-cache -e '.[audio]'; \
+    else \
+        uv pip install --system --no-cache '.[audio]'; \
+    fi
 
 # Kokoro's English grapheme-to-phoneme (misaki) loads this spaCy model at
 # startup, and pip does not pull it in. Without it the tts service crashes on

@@ -1,0 +1,59 @@
+# Development overlay: bind-mounts live source into every service and turns
+# on hot reload, so editing src/ takes effect without a rebuild.
+#
+#   docker compose -f compose.yaml -f compose.rocm.yaml -f compose.dev.yaml up --build
+#   (swap in compose.nvidia.yaml, or drop the accelerator overlay for CPU)
+#
+# Only the *first* `up --build` after adding this overlay needs --build: it's
+# what bakes the editable install (DEV=true) each Dockerfile supports for
+# exactly this. After that, editing src/ and saving is enough — no rebuild,
+# no restart — because:
+#   - stt/tts/qaa-agent set *_RELOAD=true, which switches their uvicorn.run()
+#     from a pre-built app instance to the factory-string + reload=True form
+#     (see each service's __main__.py) — uvicorn's own file-watcher re-imports
+#     create_app() on every change.
+#   - s2s runs `sofia-s2s dev` instead of `start`: livekit-agents' own
+#     watchfiles-based dev-mode watcher, no uvicorn involved.
+#
+# Not for production: an editable install plus a file-watcher is overhead
+# neither of the other overlays carries, and DEV=true is a different image
+# from the one compose.yaml/compose.*.yaml build without this file.
+# Distinct image tags throughout (see each service below): without this, a
+# dev build reuses e.g. sofia-galileo/audio:rocm, the exact tag the
+# accelerator overlays build for production — the next plain `task up:rocm`
+# would then either reuse this editable-install image or silently rebuild
+# over it, instead of cleanly rebuilding the production one.
+services:
+  stt: &dev
+    build:
+      args:
+        DEV: "true"
+    image: sofia-galileo/audio:${ACCEL:-cpu}-dev
+    environment:
+      SOFIA_STT_RELOAD: "true"
+    volumes:
+      - ./src:/app/src
+
+  tts:
+    <<: *dev
+    environment:
+      SOFIA_TTS_RELOAD: "true"
+
+  qaa-agent:
+    build:
+      args:
+        DEV: "true"
+    image: sofia-galileo/qaa-agent:dev
+    environment:
+      SOFIA_QAA_RELOAD: "true"
+    volumes:
+      - ./src:/app/src
+
+  s2s:
+    build:
+      args:
+        DEV: "true"
+    image: sofia-galileo/s2s:dev
+    command: ["sofia-s2s", "dev"]
+    volumes:
+      - ./src:/app/src

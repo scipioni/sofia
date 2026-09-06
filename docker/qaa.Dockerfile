@@ -18,7 +18,14 @@ WORKDIR /app
 # Dependency layer first: source edits then rebuild in seconds, not minutes.
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN uv pip install --system --no-cache '.[qaa]'
+# DEV=true installs editable, for compose.dev.yaml's bind mount + hot reload —
+# see docker/audio.Dockerfile's own DEV arg for the full explanation.
+ARG DEV=false
+RUN if [ "$DEV" = "true" ]; then \
+        uv pip install --system --no-cache -e '.[qaa]'; \
+    else \
+        uv pip install --system --no-cache '.[qaa]'; \
+    fi
 
 RUN useradd --create-home --uid 10001 sofia
 USER sofia

@@ -18,7 +18,15 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN uv pip install --system --no-cache '.[s2s]'
+# DEV=true installs editable, for compose.dev.yaml's bind mount + `sofia-s2s
+# dev`'s own hot reload (livekit-agents' built-in watchfiles-based watcher) —
+# see docker/audio.Dockerfile's own DEV arg for the full explanation.
+ARG DEV=false
+RUN if [ "$DEV" = "true" ]; then \
+        uv pip install --system --no-cache -e '.[s2s]'; \
+    else \
+        uv pip install --system --no-cache '.[s2s]'; \
+    fi
 
 RUN useradd --create-home --uid 10001 sofia
 USER sofia

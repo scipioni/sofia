@@ -76,6 +76,24 @@ tasks:
       - task: _up
         vars: { OVERLAY: "" }
 
+  up:rocm:dev:
+    desc: Like up:rocm, but with compose.dev.yaml's bind-mount + hot reload
+    cmds:
+      - task: _up
+        vars: { OVERLAY: "-f compose.rocm.yaml -f compose.dev.yaml" }
+
+  up:nvidia:dev:
+    desc: Like up:nvidia, but with compose.dev.yaml's bind-mount + hot reload
+    cmds:
+      - task: _up
+        vars: { OVERLAY: "-f compose.nvidia.yaml -f compose.dev.yaml" }
+
+  up:cpu:dev:
+    desc: Like up:cpu, but with compose.dev.yaml's bind-mount + hot reload
+    cmds:
+      - task: _up
+        vars: { OVERLAY: "-f compose.dev.yaml" }
+
   _up:
     internal: true
     cmds:
@@ -86,8 +104,15 @@ tasks:
       # auto-creates for a missing path comes back root-owned and the
       # container's non-root user can't write into it. Doing it here once,
       # up front, means every `task up:*` just works.
+      #
+      # Non-recursive: after the first run these directories are populated
+      # with files the container's non-root uid owns, and this host user
+      # can't chmod files it doesn't own (nor does it need to — the
+      # container manages permissions within its own subtree once it can
+      # write into the top-level directory at all). `chmod -R` here used to
+      # fail on every run after the first for exactly that reason.
       - mkdir -p "${SOFIA_MODELS_HOST_DIR:-./data/models}" "${SOFIA_HF_CACHE_HOST_DIR:-./data/hf-cache}"
-      - chmod -R a+rwX "${SOFIA_MODELS_HOST_DIR:-./data/models}" "${SOFIA_HF_CACHE_HOST_DIR:-./data/hf-cache}"
+      - chmod a+rwX "${SOFIA_MODELS_HOST_DIR:-./data/models}" "${SOFIA_HF_CACHE_HOST_DIR:-./data/hf-cache}"
       - "{{.COMPOSE}} {{.OVERLAY}} up --build"
 
   down:

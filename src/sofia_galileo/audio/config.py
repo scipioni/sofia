@@ -41,6 +41,11 @@ class SttSettings(BaseSettings):
     port: int = 8100
     log_level: str = "INFO"
     json_logs: bool = True
+    # Dev only: runs uvicorn with its own file-watcher and re-imports create_app()
+    # on every change instead of a single pre-built app instance. Needs an
+    # editable install (see docker/audio.Dockerfile's DEV build arg) so a bind
+    # mount over /app/src is actually what gets re-imported.
+    reload: bool = False
 
     # batch | streaming | both
     backend: str = "both"
@@ -138,6 +143,8 @@ class TtsSettings(BaseSettings):
     port: int = 8200
     log_level: str = "INFO"
     json_logs: bool = True
+    # Dev only: see SttSettings.reload above — same mechanism, same requirements.
+    reload: bool = False
 
     device: str = "auto"  # auto | cuda | cpu
     default_voice: str = "af_heart"
