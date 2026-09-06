@@ -73,7 +73,7 @@ services:
       retries: 5
     ports:
       # Loopback only, for curl / the `task say` / `task ask` helpers.
-      - "127.0.0.1:8100:8100"
+      - "127.0.0.1:${SOFIA_STT_HOST_PORT:-8100}:8100"
     networks: [sofia]
 
   # ------------------------------------------------------------ text to speech
@@ -103,7 +103,7 @@ services:
       retries: 5
     ports:
       # Loopback only, for curl / the `task say` helper.
-      - "127.0.0.1:8200:8200"
+      - "127.0.0.1:${SOFIA_TTS_HOST_PORT:-8200}:8200"
     networks: [sofia]
 
   # ------------------------------------------------------- the LiveKit worker
