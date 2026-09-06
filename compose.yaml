@@ -53,16 +53,36 @@ services:
       # nemotron (default) or whisper — must match SOFIA_STT_MODEL_ID
       SOFIA_STT_BATCH_ENGINE: ${SOFIA_STT_BATCH_ENGINE:-nemotron}
       SOFIA_STT_MODEL_ID: ${SOFIA_STT_MODEL_ID:-nvidia/nemotron-3.5-asr-streaming-0.6b}
-      SOFIA_STT_DEFAULT_LANGUAGE: ${SOFIA_LANGUAGE:-en}
+      SOFIA_STT_DEFAULT_LANGUAGE: ${SOFIA_LANGUAGE:-it}
       SOFIA_STT_DEVICE: ${SOFIA_AUDIO_DEVICE:-auto}
+      # parakeet (default — Nemotron via parakeet.cpp — punctuated, cased,
+      # covers Italian; needs a Vulkan- or CUDA-capable build of docker/audio.Dockerfile)
+      # sherpa (no Italian, no punctuation)
+      SOFIA_STT_STREAMING_ENGINE: ${SOFIA_STT_STREAMING_ENGINE:-parakeet}
       SOFIA_STT_SHERPA_MODEL_URL: ${SOFIA_STT_SHERPA_MODEL_URL:-https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2}
       SOFIA_STT_SHERPA_RULE2_MIN_TRAILING_SILENCE: ${SOFIA_STT_ENDPOINT_SILENCE:-0.8}
+      SOFIA_STT_PARAKEET_MODEL_URL: ${SOFIA_STT_PARAKEET_MODEL_URL:-https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/nemotron-3.5-asr-streaming-0.6b-f16.gguf}
+      # Same knob as sherpa's rule2 above, conceptually: how much trailing
+      # silence after speech ends a turn. Nemotron has no end-of-utterance
+      # signal of its own (see openspec/changes/add-parakeet-streaming-asr),
+      # so ParakeetSession implements this rule itself rather than relying on
+      # the model.
+      SOFIA_STT_PARAKEET_ENDPOINT_SILENCE: ${SOFIA_STT_ENDPOINT_SILENCE:-0.8}
     volumes:
-      - hf-cache:/home/sofia/.cache/huggingface
-      - models:/home/sofia/models
+      # Host-browseable directories, not Docker-managed volumes — you can `ls`
+      # what got downloaded. Bind-mounted, so unlike a named volume Docker will
+      # NOT auto-chown these to the container's uid on first use; `task up:*`
+      # creates them and opens permissions before starting the stack (see
+      # Taskfile.yml `_up`) — if you start containers another way, do the same
+      # (`mkdir -p` + `chmod -R a+rwX` the two paths below) or writes fail.
+      - ${SOFIA_HF_CACHE_HOST_DIR:-./data/hf-cache}:/home/sofia/.cache/huggingface
+      - ${SOFIA_MODELS_HOST_DIR:-./data/models}:/home/sofia/models
       # MIOpen (AMD) JIT-compiles kernels per tensor shape; persisting the cache
       # means each shape costs seconds once per deployment, not per boot. The
-      # directory is simply unused on CPU/NVIDIA builds.
+      # directory is simply unused on CPU/NVIDIA builds. Left as a named
+      # volume, not a bind mount: it holds compiled kernel blobs, not models —
+      # nothing worth browsing, and no reason to take on the ownership caveat
+      # above for it.
       - miopen-cache:/home/sofia/.cache/miopen
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8100/healthz"]
@@ -73,7 +93,7 @@ services:
       retries: 5
     ports:
       # Loopback only, for curl / the `task say` / `task ask` helpers.
-      - "127.0.0.1:8100:8100"
+      - "127.0.0.1:${SOFIA_STT_HOST_PORT:-8100}:8100"
     networks: [sofia]
 
   # ------------------------------------------------------------ text to speech
@@ -92,8 +112,15 @@ services:
       SOFIA_TTS_LOG_LEVEL: ${SOFIA_LOG_LEVEL:-INFO}
       SOFIA_TTS_DEFAULT_VOICE: ${SOFIA_TTS_VOICE:-af_heart}
       SOFIA_TTS_DEVICE: ${SOFIA_AUDIO_DEVICE:-auto}
+      # Works around a known ROCm HSA runtime bug (AsyncEventsLoop busy-spin):
+      # the pip-bundled ROCm runtime's background event thread spins at 100%
+      # of one CPU core indefinitely after any GPU op, even fully idle. This
+      # is the only service that showed it (stt, on the same runtime, did
+      # not) — confirmed fixed in a standalone container: CPU dropped from
+      # ~100% to ~0.1% at idle with this set, synthesis still correct.
+      GPU_MAX_HW_QUEUES: 1
     volumes:
-      - hf-cache:/home/sofia/.cache/huggingface
+      - ${SOFIA_HF_CACHE_HOST_DIR:-./data/hf-cache}:/home/sofia/.cache/huggingface
       - miopen-cache:/home/sofia/.cache/miopen
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8200/healthz"]
@@ -103,7 +130,7 @@ services:
       retries: 5
     ports:
       # Loopback only, for curl / the `task say` helper.
-      - "127.0.0.1:8200:8200"
+      - "127.0.0.1:${SOFIA_TTS_HOST_PORT:-8200}:8200"
     networks: [sofia]
 
   # ------------------------------------------------------- the LiveKit worker
@@ -119,15 +146,23 @@ services:
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set your LiveKit API secret}
 
       SOFIA_S2S_LOG_LEVEL: ${SOFIA_LOG_LEVEL:-INFO}
-      SOFIA_S2S_LANGUAGE: ${SOFIA_LANGUAGE:-en}
+      SOFIA_S2S_LANGUAGE: ${SOFIA_LANGUAGE:-it}
       SOFIA_S2S_AGENT_NAME: ${SOFIA_S2S_AGENT_NAME:-}
 
       SOFIA_S2S_QAA_BASE_URL: http://qaa-agent:8000/v1
       SOFIA_S2S_STT_BASE_URL: http://stt:8100/v1
       # true -> streaming ASR over ws://stt:8100/v1/realtime
-      SOFIA_S2S_STT_USE_REALTIME: ${SOFIA_STT_STREAMING:-false}
+      SOFIA_S2S_STT_USE_REALTIME: ${SOFIA_STT_STREAMING:-true}
       SOFIA_S2S_TTS_BASE_URL: http://tts:8200/v1
-      SOFIA_S2S_TTS_VOICE: ${SOFIA_TTS_VOICE:-af_heart}
+      SOFIA_S2S_TTS_VOICE: ${SOFIA_TTS_VOICE:-if_sara}
+      # Floor and ceiling for the semantic turn detector, in seconds. The
+      # ceiling is the one that bites: an uncertain semantic model waits up to
+      # this long before deciding the person is done — measured stalling a
+      # real turn to its full 5.0s default (see docs/benchmark.md). Lower for
+      # a more reactive agent; the trade-off is a higher chance of cutting
+      # someone off mid-thought on a genuinely ambiguous pause.
+      SOFIA_S2S_MIN_ENDPOINTING_DELAY: ${SOFIA_S2S_MIN_ENDPOINTING_DELAY:-0.4}
+      SOFIA_S2S_MAX_ENDPOINTING_DELAY: ${SOFIA_S2S_MAX_ENDPOINTING_DELAY:-5.0}
     depends_on:
       stt:
         condition: service_healthy
@@ -142,6 +177,6 @@ networks:
     driver: bridge
 
 volumes:
-  hf-cache:
-  models:
+  # hf-cache and models are bind mounts now (see the stt/tts service comments
+  # above), not declared here — only miopen-cache is still Docker-managed.
   miopen-cache:

@@ -33,23 +33,30 @@ class S2SSettings(BaseSettings):
     stt_base_url: str = "http://stt:8100/v1"
     stt_api_key: str = "sofia"
     stt_model: str = "whisper-1"
-    language: str = "en"
+    language: str = "it"
     # True  -> websocket streaming ASR (ws://.../v1/realtime): the transcript is
     #          decoded while the person talks, so end-of-turn costs ~nothing.
     # False -> batch Whisper: more accurate and punctuated, but the whole
     #          utterance is transcribed only after they stop.
     # The stt service must be serving the matching backend (SOFIA_STT_BACKEND).
-    stt_use_realtime: bool = False
+    stt_use_realtime: bool = True
 
     # --- text to speech ---
     tts_base_url: str = "http://tts:8200/v1"
     tts_api_key: str = "sofia"
     tts_model: str = "kokoro"
-    tts_voice: str = "af_heart"
+    tts_voice: str = "if_sara"
     tts_speed: float = 1.0
     # wav or pcm. The livekit plugin would otherwise default to mp3, which the
-    # Kokoro service does not encode.
-    tts_response_format: str = "wav"
+    # Kokoro service does not encode. pcm is what actually gets streamed
+    # incrementally (openspec/changes/add-streaming-tts/design.md D2/D3) — wav
+    # still works, but Kokoro must finish the whole reply before any of it can
+    # be sent, since a WAV header has to declare a total length upfront.
+    # pcm's 24kHz mono has no in-band format metadata; it decodes correctly
+    # only because it matches livekit.plugins.openai.tts's hardcoded
+    # SAMPLE_RATE=24000/NUM_CHANNELS=1 and tts_app.py's TtsSettings.sample_rate
+    # — if either ever changes, this decodes as silent noise, not an error.
+    tts_response_format: str = "pcm"
 
     # Spoken once, when the agent joins. Empty means wait for the human to speak
     # first — which is often the better choice for inbound calls.

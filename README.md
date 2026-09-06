@@ -5,6 +5,7 @@ A vocal agent that joins a LiveKit room, listens to people, and talks back.
 Bring your own OpenAI-compatible LLM. Everything else runs in four containers,
 on NVIDIA, AMD, or plain CPU.
 
+> Zero to a human talking to Sofia: **[docs/quick.md](docs/quick.md)**
 > Design rationale, measurements and production notes: **[docs/details.md](docs/details.md)**
 > Latency and throughput benchmarks on the reference AMD deployment: **[docs/benchmark.md](docs/benchmark.md)**
 
@@ -100,10 +101,10 @@ the audio image.
 **Models** — fetched on first boot into the `hf-cache` / `models` volumes, so it
 happens once:
 
-| Role | Default | Size |
+| Role | Default / Alternatives | Size |
 |---|---|---|
-| Batch ASR | `nvidia/nemotron-3.5-asr-streaming-0.6b` | ~1.3 GB |
-| Streaming ASR | sherpa-onnx streaming zipformer (en) | ~310 MB |
+| Batch ASR | `nvidia/nemotron-3.5-asr-streaming-0.6b` (default) <br>Alternative: Whisper | ~1.3 GB <br>Varies |
+| Streaming ASR | `sherpa-onnx` streaming zipformer (en) (default) <br>Alternative: `parakeet` (Nemotron 3.5 GGUF for Italian/multilingual) | ~310 MB <br>~640 MB (Q8_0) |
 | TTS | Kokoro-82M | ~330 MB |
 | VAD + turn detection | Silero + LiveKit multilingual | baked into the s2s image |
 

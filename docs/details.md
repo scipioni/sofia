@@ -12,9 +12,13 @@ Four containers, two of which are the ones that matter:
 - **`qaa-agent.service`** — the brain. Owns the system prompt, the conversation
   policy, and the tools. Exposes an **OpenAI-compatible** API and calls your own
   OpenAI-compatible LLM upstream.
-- `stt` / `tts` — OpenAI-compatible shims over ASR and Kokoro. `stt` serves two
-  backends: **streaming** sherpa-onnx over a websocket, and **batch** Nemotron
-  3.5 (or Whisper) over HTTP. See [Streaming vs batch ASR](#streaming-vs-batch-asr).
+- `stt` / `tts` — OpenAI-compatible shims over ASR and Kokoro. `stt` serves
+  **batch** Nemotron 3.5 (or Whisper) over HTTP, and **streaming** over a
+  websocket — sherpa-onnx by default, or Nemotron again via parakeet.cpp/ggml
+  for deployments that need Italian while streaming. See
+  [Streaming vs batch ASR](#streaming-vs-batch-asr). `tts` streams speech back
+  as Kokoro produces it (`response_format=pcm`, `s2s`'s default) rather than
+  synthesising the whole reply first — see [docs/benchmark.md](benchmark.md).
 
 ## Why qaa-agent speaks OpenAI, not a custom protocol
 
@@ -39,21 +43,35 @@ several things for free:
 ## Streaming vs batch ASR
 
 The `stt` service serves both, and s2s picks one with a single flag. This is the
-most consequential setting in the project.
+most consequential setting in the project. Streaming itself has two engines —
+`SOFIA_STT_STREAMING_ENGINE` — because no single one covers every language with
+punctuation on a CPU.
 
 ```bash
-SOFIA_STT_STREAMING=true    # websocket, sherpa-onnx  — decodes while they talk
+SOFIA_STT_STREAMING=true    # websocket — sherpa-onnx or parakeet, see below
 SOFIA_STT_STREAMING=false   # HTTP, Nemotron 3.5      — decodes after they stop
 ```
 
-|  | streaming (sherpa-onnx) | batch (Nemotron 3.5) |
-|---|---|---|
-| Transcript ready | while they are still speaking | ~0.1× audio length after they stop |
-| Punctuation / casing | none — `hello this is sofia` | full — `Hello, this is Sofia.` |
-| Accuracy | lower (heard "to day" for "today") | high (4.25% WER Italian, FLEURS) |
-| Languages | en, fr, de, es, ru, zh, ko… **no Italian** | 40 locales **including `it-IT`** |
-| Hardware | CPU, ~0.06 RTF | CPU, ~0.08 RTF — GPU optional |
-| Interim transcripts | yes — the turn detector can use them | no |
+|  | streaming (sherpa-onnx) | streaming (parakeet.cpp) | batch (Nemotron 3.5) |
+|---|---|---|---|
+| Transcript ready | while they are still speaking | while they are still speaking | ~0.1× audio length after they stop |
+| Punctuation / casing | none — `hello this is sofia` | full — `Hello, this is Sofia.` | full — `Hello, this is Sofia.` |
+| Accuracy | lower (heard "to day" for "today") | same model as batch (below) | high (4.25% WER Italian, FLEURS) |
+| Languages | en, fr, de, es, ru, zh, ko… **no Italian** | same 40 locales as batch, **including `it-IT`** | 40 locales **including `it-IT`** |
+| Hardware | CPU, ~0.06 RTF | **GPU** (Vulkan or CUDA), RTF ~0.10 measured on an RX 9060 XT | CPU, ~0.08 RTF — GPU optional |
+| Turn boundary | model's own endpoint detection | its own trailing-silence rule (no model signal — see below) | n/a |
+| Interim transcripts | yes — the turn detector can use them | yes | no |
+
+parakeet.cpp runs the same Nemotron weights sherpa can't stream and batch
+already uses, just through a different (ggml) runtime — so it inherits batch's
+language coverage and accuracy, at the cost of needing a GPU-capable
+`docker/audio.Dockerfile` build. See `openspec/changes/add-parakeet-streaming-asr/`
+(design.md, especially D6) for the full reasoning, including a finding that
+mattered enough to change the design: Nemotron has **no end-of-utterance signal
+of its own** — that capability belongs only to the separate, English-only
+`nvidia/parakeet_realtime_eou_120m-v1` model — so the parakeet engine
+implements its own trailing-silence rule (`SOFIA_STT_PARAKEET_ENDPOINT_SILENCE`,
+same 0.8 s default as sherpa's rule2) rather than relying on the model for it.
 
 Because Nemotron is so fast, batch is no longer the slow option it was with
 Whisper. Measured on one CPU core, same 6.6 s Italian clip, same container:
@@ -87,12 +105,16 @@ LiveKit's own endpointing runs on top of it.
 
 Notes on the trade-off:
 
-- **CPU is the right answer here**, not a compromise — for both backends. Neither
+- **CPU is the right answer for sherpa and batch**, not a compromise — neither
   needs a GPU, which sidesteps ROCm entirely (the sherpa-onnx wheels ship CUDA
-  only, and Nemotron is small enough not to care).
-- **For Italian, use batch.** No streaming Italian model exists in sherpa-onnx —
-  streaming covers en/fr/de/es/ru/zh/ko, and the multilingual models that do
-  include Italian are offline-only. Batch Nemotron handles `it-IT` natively.
+  only, and Nemotron is small enough not to care on a CPU in batch mode).
+  Streaming Nemotron via parakeet.cpp is the exception: it needs a GPU to be
+  worth running over batch — see [GPU targets](#gpu-targets).
+- **For Italian while streaming, use `SOFIA_STT_STREAMING_ENGINE=parakeet`**
+  on a GPU-capable deployment, or batch on a CPU-only one. No streaming Italian
+  model exists in sherpa-onnx — it covers en/fr/de/es/ru/zh/ko — and the
+  multilingual models that do include Italian were offline-only until
+  parakeet.cpp made Nemotron's own streaming mode usable outside NeMo.
 - **Nemotron takes locales, not language codes.** `SOFIA_LANGUAGE=it` is mapped
   to `it-IT` for you; unknown codes fall back to `auto` rather than to a guessed
   locale, since a wrong locale quietly wrecks accuracy. Auto-detection measures
@@ -109,7 +131,8 @@ Notes on the trade-off:
 
 Application code is identical on both platforms — PyTorch's ROCm build exposes
 the same `torch.cuda` API as the CUDA build, so `stt` and `tts` never branch on
-vendor. The images differ only in which PyTorch wheel index they install from:
+vendor for torch. The images differ only in which PyTorch wheel index they
+install from:
 
 | Target | Overlay | Wheel index | Host requirement |
 |---|---|---|---|
@@ -118,6 +141,17 @@ vendor. The images differ only in which PyTorch wheel index they install from:
 | CPU | *(none)* | `…/whl/cpu` | nothing |
 
 `s2s` and `qaa-agent` build once and run anywhere; they hold no weights.
+
+**The parakeet streaming engine picks its own backend independently**, via the
+`PARAKEET_BACKEND` build arg (`vulkan` default, or `hip`/`cuda`/`cpu`) — Vulkan
+because it runs the identical build on AMD and NVIDIA, which torch's own
+wheel-per-vendor split does not buy you. `hip` and `cuda` select the right
+`cmake` flag but need a different builder base image than this Dockerfile
+ships (ggml needs `hipcc`/`nvcc` at build time, not just a runtime library) —
+they fail the build with a clear error rather than silently doing something
+else. Measured on the target card for this integration (RX 9060 XT, gfx1200,
+RDNA4): the GPU enumerates correctly under Vulkan/RADV and returns to idle
+power within seconds of the process exiting.
 
 **AMD notes.** `group_add` in the overlay uses group *names*, which only resolve
 if `video`/`render` exist inside the container — if the GPU comes back invisible,
@@ -168,6 +202,29 @@ SOFIA_STT_SHERPA_MODEL_DIR=/path/to/sherpa-onnx-streaming-zipformer-en-... \
     uv run pytest tests/test_streaming_asr.py -v
 ```
 
+`tests/test_parakeet_streaming.py` covers engine selection and the resampler
+unconditionally (no model needed — the resampler bug it caught, a silently
+dropped final ~35 ms of trailing audio on every `finalize()`, only shows up in
+a test that checks exact output length, not just a matching prefix). The real
+parakeet.cpp engine is exercised the same opt-in way as sherpa above:
+
+```bash
+SOFIA_STT_PARAKEET_LIBRARY_PATH=/path/to/libparakeet.so \
+SOFIA_STT_PARAKEET_MODEL_PATH=/path/to/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf \
+SOFIA_STT_PARAKEET_TEST_WAV=/path/to/16kHz-mono-italian.wav \
+    uv run pytest tests/test_parakeet_streaming.py -v
+```
+
+`tests/test_tts.py` covers the streaming TTS path with a fake Kokoro engine,
+not the real model — Kokoro's own inference turned out to be non-deterministic
+between independent calls (confirmed empirically: two unmodified calls on the
+same input differ, max abs diff ~0.08), so bit-comparing against the real
+model would test Kokoro's own randomness, not the streaming refactor. It also
+had to route around `TestClient`'s ASGI transport, which coalesces separate
+response chunks into one blob — chunk-boundary assertions test the streaming
+generator directly instead; real incremental delivery over an actual socket
+was confirmed separately (`openspec/changes/add-streaming-tts/tasks.md`).
+
 ## Things to know before production
 
 - **Latency budget.** The interesting numbers are per-stage: STT, LLM
@@ -178,9 +235,10 @@ SOFIA_STT_SHERPA_MODEL_DIR=/path/to/sherpa-onnx-streaming-zipformer-en-... \
   audio is transcribed, reasoned over as text, and re-synthesised. A true S2S
   model (OpenAI Realtime, Moshi, Qwen-Omni) reaches ~300 ms and full duplex, but
   the model *is* the LLM — incompatible with bringing your own.
-- **First boot downloads models.** ~1.3 GB for Nemotron, ~310 MB for the
-  streaming model. The healthcheck allows ten minutes; the `hf-cache` and
-  `models` volumes mean it happens once.
+- **First boot downloads models.** ~1.3 GB for batch Nemotron, ~310 MB for the
+  sherpa streaming model, and (only if `SOFIA_STT_STREAMING_ENGINE=parakeet`)
+  ~939 MB for the parakeet GGUF. The healthcheck allows ten minutes; the
+  `hf-cache` and `models` volumes mean it happens once.
 - **Nemotron's licence is OpenMDW-1.1**, not Apache or MIT. It is a permissive
   open-model licence, but read it before shipping commercially. Whisper
   (MIT) and the sherpa-onnx models remain available as alternatives.

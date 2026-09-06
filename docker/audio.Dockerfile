@@ -16,6 +16,58 @@
 # Must be declared before the first FROM to be usable in FROM interpolation.
 ARG WITH_ROCRAND_HEADERS=without-rocrand
 
+# Compute backend for the streaming ASR engine (parakeet.cpp / ggml), chosen
+# independently of TORCH_INDEX_URL above: Vulkan runs the same binary on AMD
+# and NVIDIA alike (see design.md D1 in add-parakeet-streaming-asr), so it is
+# the default even though the host here is ROCm. HIP and CUDA are recognised
+# values, but ggml's HIP/CUDA backends need hipcc/nvcc at *build* time, not
+# just a runtime library — wiring those in means swapping this stage's builder
+# base for a ROCm or CUDA devel image, which this change does not do. Passing
+# PARAKEET_BACKEND=hip or =cuda today will fail the build with a clear cmake
+# error (no such compiler) rather than silently falling back to something else.
+ARG PARAKEET_BACKEND=vulkan
+ARG PARAKEET_COMMIT=e75de9b6b9b688fd293aa22f7e27aa724ea286f8
+
+# --- parakeet.cpp (streaming ASR engine) builder ----------------------------
+# Built from source because upstream ships no prebuilt libparakeet.so; the
+# GGUF model weights it loads at runtime ARE prebuilt (see ensure_model() in
+# audio/streaming.py) so this stage never touches model weights, only ~2 MB of
+# C++ source plus the vendored ggml submodule.
+FROM python:3.12-slim AS parakeet-builder
+ARG PARAKEET_BACKEND
+ARG PARAKEET_COMMIT
+
+# glslc/glslang-tools/spirv-headers/libvulkan-dev: Vulkan backend only, but
+# installed unconditionally — they are small and PARAKEET_BACKEND=cpu still
+# needs cmake/build-essential/git/ninja-build regardless.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates git cmake ninja-build build-essential \
+        glslc glslang-tools spirv-headers libvulkan-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN git clone --recursive https://github.com/mudler/parakeet.cpp . \
+    && git checkout "${PARAKEET_COMMIT}"
+
+# One cmake bool per backend name; PARAKEET_SHARED=ON is what makes cmake
+# build libparakeet.so instead of a static libparakeet.a (ctypes needs the
+# former). GGML_NATIVE=OFF: this image is built once and run on whatever host
+# pulls it, so it must not bake in the *build* host's ISA extensions.
+RUN case "${PARAKEET_BACKEND}" in \
+        vulkan) BACKEND_FLAG="-DPARAKEET_GGML_VULKAN=ON" ;; \
+        cpu)    BACKEND_FLAG="" ;; \
+        hip)    BACKEND_FLAG="-DPARAKEET_GGML_HIP=ON" ;; \
+        cuda)   BACKEND_FLAG="-DPARAKEET_GGML_CUDA=ON" ;; \
+        *) echo "PARAKEET_BACKEND must be vulkan, cpu, hip or cuda; got '${PARAKEET_BACKEND}'" >&2; exit 1 ;; \
+    esac \
+    && cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DPARAKEET_SHARED=ON \
+        -DGGML_NATIVE=OFF \
+        ${BACKEND_FLAG} \
+    && cmake --build build --target parakeet -j"$(nproc)"
+
 # --- ROCm headers (AMD only) -------------------------------------------------
 # MIOpen JIT-compiles some kernels at first use (the LSTM dropout inside
 # Kokoro, among others); those sources #include <rocrand/…> and <hip/…>
@@ -30,12 +82,18 @@ COPY --from=rocm-ctx include/ /usr/local/include/
 
 FROM busybox AS without-rocrand
 WORKDIR /opt/rocm/include/rocrand
+# The final stage's COPY --from=rocrand-headers /usr/local/include/ ... needs
+# this path to exist here even when there's nothing to copy — a COPY whose
+# source is entirely absent (not just empty) is a hard build error, not a
+# no-op.
+RUN mkdir -p /usr/local/include
 
 FROM ${WITH_ROCRAND_HEADERS} AS rocrand-headers
 
 FROM python:3.12-slim
 
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG WITH_ROCRAND_HEADERS
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -46,13 +104,40 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # ffmpeg  : how transformers decodes whatever audio container arrives
 # espeak-ng: Kokoro's fallback grapheme-to-phoneme for out-of-vocabulary words
-# libstdc++-12-dev: on AMD, MIOpen JIT-compiles kernels with the bundled clang
-#   at first use; those device sources include C++ standard headers (<utility>
-#   …) that slim images do not carry. Harmless on CPU/NVIDIA.
+# libvulkan1/mesa-vulkan-drivers: the Vulkan loader plus Mesa's RADV/lavapipe
+#   ICDs, needed at runtime by libggml-vulkan.so regardless of which vendor's
+#   GPU is behind /dev/dri — NVIDIA hosts get their own ICD from the driver the
+#   container runtime mounts in (see NVIDIA_DRIVER_CAPABILITIES in
+#   compose.nvidia.yaml), Mesa's own ICD is simply unused there.
+# libgomp1: ggml's CPU backend is OpenMP-parallel even when Vulkan does the
+#   matmuls — the mel front end and tokenizer run on CPU regardless of backend.
+#
+# libstdc++-12-dev is added conditionally below, gated on the same
+# WITH_ROCRAND_HEADERS build arg as the rocrand include tree above: on AMD,
+# MIOpen JIT-compiles kernels with the bundled clang at first use, and those
+# device sources include C++ standard headers (<utility> …) that slim images
+# do not carry. It is a -dev package (hundreds of MB), not a runtime lib, so
+# CPU/NVIDIA builds — which never touch MIOpen's JIT path — skip it rather
+# than carrying it "harmlessly."
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl ffmpeg espeak-ng libsndfile1 libstdc++-12-dev \
+        ca-certificates curl ffmpeg espeak-ng libsndfile1 \
+        libvulkan1 mesa-vulkan-drivers libgomp1 \
+        $( [ "$WITH_ROCRAND_HEADERS" = "with-rocrand" ] && echo libstdc++-12-dev ) \
     && rm -rf /var/lib/apt/lists/*
+
+# parakeet.cpp runtime: libparakeet.so plus the ggml shared libraries it links
+# against (built separately, not statically linked in). Streaming ASR only —
+# tts never touches these, but the image is shared between both commands. The
+# 0.13.0 in these filenames is the vendored ggml submodule's version at
+# PARAKEET_COMMIT above, not something to track independently — it moves only
+# when that pinned commit changes.
+COPY --from=parakeet-builder /src/build/libparakeet.so /usr/local/lib/
+COPY --from=parakeet-builder /src/build/third_party/ggml/src/libggml.so.0.13.0 /usr/local/lib/libggml.so.0
+COPY --from=parakeet-builder /src/build/third_party/ggml/src/libggml-cpu.so.0.13.0 /usr/local/lib/libggml-cpu.so.0
+COPY --from=parakeet-builder /src/build/third_party/ggml/src/libggml-base.so.0.13.0 /usr/local/lib/libggml-base.so.0
+COPY --from=parakeet-builder /src/build/third_party/ggml/src/ggml-vulkan/libggml-vulkan.so.0.13.0 /usr/local/lib/libggml-vulkan.so.0
+RUN ldconfig
 
 WORKDIR /app
 
@@ -73,12 +158,19 @@ RUN python -m spacy download en_core_web_sm
 
 RUN useradd --create-home --uid 10001 sofia
 
-# Model weights land here. Mount a volume so they survive a rebuild — otherwise
-# every image change re-downloads several gigabytes from Hugging Face.
+# Model weights land here. Mount something so they survive a rebuild —
+# otherwise every image change re-downloads several gigabytes from Hugging
+# Face. compose.yaml bind-mounts host directories here (browseable, path set
+# via SOFIA_MODELS_HOST_DIR / SOFIA_HF_CACHE_HOST_DIR in .env; see Taskfile.yml
+# `_up` for why those need creating and opening up before first use — a bind
+# mount does not inherit the ownership below the way a fresh named volume
+# would).
 #
-# The directory must exist *in the image*, owned by sofia: Docker seeds a fresh
-# named volume from the image path it covers, ownership included. Without this
-# the volume arrives root-owned and the non-root process cannot write to it.
+# The directory must exist *in the image* regardless, owned by sofia: this is
+# what makes a plain named volume (the miopen one below, or hf-cache/models if
+# you point compose at one instead of a host path) come up owned by sofia
+# rather than root — Docker seeds a fresh named volume from the image path it
+# covers, ownership included, but has nothing to seed from for a bind mount.
 ENV HF_HOME=/home/sofia/.cache/huggingface \
     SOFIA_MODELS_DIR=/home/sofia/models
 # miopen-cache: MIOpen's JIT kernel cache, volume-mounted so each tensor shape

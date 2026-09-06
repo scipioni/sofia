@@ -1,16 +1,22 @@
-"""Streaming ASR built on sherpa-onnx.
+"""Streaming ASR: two engines behind one `StreamingRecognizer` interface.
 
-A streaming zipformer transducer decodes as audio arrives, so by the time the
-person stops talking the transcript is already there — end-of-turn costs a few
-tens of milliseconds instead of a full Whisper pass. That is the whole reason
-this module exists; see the README for the accuracy trade-off it buys.
+``sherpa``    A streaming zipformer transducer via sherpa-onnx. Decodes as audio
+              arrives, so by the time the person stops talking the transcript
+              is already there. No Italian, no punctuation. Endpointing is the
+              model's own: sherpa-onnx decides an utterance has finished from
+              trailing silence plus what it has decoded, which is cheaper and
+              better-timed than bolting a separate VAD on top.
+``parakeet``  Nemotron 3.5 ASR via parakeet.cpp/ggml (ctypes). Punctuated,
+              cased, covers Italian. Has no end-of-utterance signal of its own
+              — that belongs only to the separate, English-only
+              nvidia/parakeet_realtime_eou_120m-v1 model — so its session
+              implements its own trailing-silence rule instead (see
+              design.md D6 in openspec/changes/add-parakeet-streaming-asr).
 
-Endpointing is the model's own: sherpa-onnx decides an utterance has finished
-from trailing silence plus what it has decoded, which is both cheaper and
-better-timed than bolting a separate VAD on top.
-
-The recognizer is hidden behind `StreamingSession` so the websocket protocol
-layer can be tested against a fake, without a 300 MB model on disk.
+Which one a deployment runs is `SttSettings.streaming_engine`; `sherpa` is the
+default. Both are hidden behind `StreamingRecognizer`/`StreamingSession` so the
+websocket protocol layer (realtime.py) can be tested against a fake, without a
+model on disk of either kind.
 """
 
 from __future__ import annotations
@@ -97,6 +103,30 @@ def ensure_model(url: str, target: Path) -> Path:
     return target
 
 
+def ensure_file(url: str, target: Path) -> Path:
+    """Download a single file into place if it is not there yet.
+
+    Same staged-move discipline as ensure_model() above, but for one file (a
+    GGUF) rather than a directory extracted from a release tarball: download
+    to a temporary path next to the target and rename into place only once
+    complete, so a killed download cannot leave a half-file that looks usable
+    on the next boot.
+    """
+    if target.exists():
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    log.info("stt.model.downloading", url=url, target=str(target))
+
+    tmp = target.with_name(target.name + ".part")
+    with urllib.request.urlopen(url) as response, tmp.open("wb") as fh:
+        shutil.copyfileobj(response, fh)
+    tmp.rename(target)
+
+    log.info("stt.model.ready", target=str(target))
+    return target
+
+
 def _pick(model_dir: Path, prefix: str, *, prefer_int8: bool) -> str:
     """Find one of the three transducer parts without hard-coding release names.
 
@@ -121,6 +151,7 @@ class SherpaRecognizer:
         model_dir = ensure_model(settings.sherpa_model_url, settings.sherpa_model_dir)
         log.info(
             "stt.streaming.loading",
+            engine="sherpa",
             model_dir=str(model_dir),
             provider=settings.sherpa_provider,
             encoder_int8=settings.sherpa_encoder_int8,
@@ -146,7 +177,7 @@ class SherpaRecognizer:
 
         self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
         self._normalize_case = settings.sherpa_normalize_case
-        log.info("stt.streaming.ready")
+        log.info("stt.streaming.ready", engine="sherpa")
 
     def session(self) -> StreamingSession:
         return _SherpaSession(self._recognizer, normalize_case=self._normalize_case)
@@ -200,3 +231,146 @@ class _SherpaSession:
         text = self._current()
         self._recognizer.reset(self._stream)
         return Transcript(text=text, is_final=True)
+
+
+# --------------------------------------------------------------------------
+# parakeet.cpp (Nemotron 3.5 ASR) backend
+# --------------------------------------------------------------------------
+
+_PARAKEET_SAMPLE_RATE = 16000
+# ~ -40 dBFS. Below this a 50ms frame counts as silence for endpointing
+# purposes — the same job sherpa_rule2/rule3 do via the model's own decoder
+# state, which the flat C-API does not expose.
+_PARAKEET_SILENCE_RMS = 0.01
+
+
+class ParakeetRecognizer:
+    """Loads Nemotron once via ctypes; hands out a cheap stream per connection."""
+
+    def __init__(self, settings: SttSettings) -> None:
+        from sofia_galileo.audio import parakeet_capi
+        from sofia_galileo.audio.batch import to_locale
+
+        model_path = ensure_file(settings.parakeet_model_url, settings.parakeet_model_path)
+        log.info("stt.streaming.loading", engine="parakeet", model_path=str(model_path))
+
+        lib = parakeet_capi.load_library(settings.parakeet_library_path)
+        self._ctx = parakeet_capi.ParakeetContext(lib, str(model_path))
+        self._lang = to_locale(settings.default_language)
+        self._endpoint_silence = settings.parakeet_endpoint_silence
+        self._min_utterance_length = settings.parakeet_min_utterance_length
+        log.info("stt.streaming.ready", engine="parakeet", lang=self._lang)
+
+    def session(self) -> StreamingSession:
+        return _ParakeetSession(
+            self._ctx, self._lang, self._endpoint_silence, self._min_utterance_length
+        )
+
+
+class _ParakeetSession:
+    def __init__(
+        self,
+        ctx: Any,
+        lang: str,
+        endpoint_silence: float,
+        min_utterance_length: float,
+    ) -> None:
+        self._ctx = ctx
+        self._lang = lang
+        self._endpoint_silence = endpoint_silence
+        self._min_utterance_length = min_utterance_length
+        self._stream = ctx.stream(lang)
+        self._resampler: Any = None
+        self._resampler_rate: int | None = None
+        self._text = ""
+        self._trailing_silence_s = 0.0
+        self._utterance_s = 0.0
+
+    def _resample(self, samples: np.ndarray, sample_rate: int, *, last: bool = False) -> np.ndarray:
+        if sample_rate == _PARAKEET_SAMPLE_RATE:
+            return samples.astype(np.float32, copy=False)
+        if self._resampler is None or self._resampler_rate != sample_rate:
+            # A session is tied to the rate of its first frame: LiveKit never
+            # changes rate mid-call, so this builds the resampler exactly once.
+            # soxr.ResampleStream carries its filter delay line across calls —
+            # a stateless per-frame resample would introduce a discontinuity at
+            # every 50ms frame boundary (design.md D5).
+            import soxr
+
+            self._resampler = soxr.ResampleStream(
+                sample_rate, _PARAKEET_SAMPLE_RATE, 1, dtype="float32", quality="HQ"
+            )
+            self._resampler_rate = sample_rate
+        return self._resampler.resample_chunk(samples.astype(np.float32, copy=False), last=last)
+
+    def _reset(self) -> None:
+        self._stream.close()
+        self._stream = self._ctx.stream(self._lang)
+        self._text = ""
+        self._trailing_silence_s = 0.0
+        self._utterance_s = 0.0
+
+    def push(self, samples: np.ndarray, sample_rate: int) -> Transcript:
+        if len(samples) == 0:
+            return Transcript(text=self._text, is_final=False)
+
+        chunk_s = len(samples) / sample_rate
+        rms = float(np.sqrt(np.mean(np.square(samples))))
+        pcm16k = self._resample(samples, sample_rate)
+
+        # eou is intentionally ignored: Nemotron does not populate it (see
+        # design.md D6). Turn boundaries come from the trailing-silence rule
+        # below instead.
+        new_text, _eou = self._stream.feed(pcm16k)
+        if new_text:
+            self._text += new_text
+
+        if rms < _PARAKEET_SILENCE_RMS:
+            self._trailing_silence_s += chunk_s
+        else:
+            self._trailing_silence_s = 0.0
+        self._utterance_s += chunk_s
+
+        endpointed = bool(self._text) and (
+            self._trailing_silence_s >= self._endpoint_silence
+            or self._utterance_s >= self._min_utterance_length
+        )
+        if endpointed:
+            text = self._text
+            self._reset()
+            return Transcript(text=text, is_final=True)
+        return Transcript(text=self._text, is_final=False)
+
+    def finalize(self) -> Transcript:
+        # soxr.ResampleStream buffers an algorithmic delay internally; without
+        # this flush the last ~tens of ms of audio — exactly the trailing
+        # context the model needs to commit its last tokens — is silently
+        # dropped (caught by test_resample_ratio_is_exact_two_thirds).
+        if self._resampler is not None:
+            flushed = self._resampler.resample_chunk(np.zeros(0, dtype=np.float32), last=True)
+            if len(flushed):
+                new_text, _eou = self._stream.feed(flushed)
+                if new_text:
+                    self._text += new_text
+            # A flushed ResampleStream raises "Input after last input" on
+            # further use; clear() re-arms it for the next utterance in this
+            # same connection (input_audio_buffer.commit does not end the
+            # session — see realtime.py).
+            self._resampler.clear()
+
+        tail = self._stream.finalize()
+        if tail:
+            self._text += tail
+        text = self._text
+        self._reset()
+        return Transcript(text=text, is_final=True)
+
+
+def build_recognizer(settings: SttSettings) -> StreamingRecognizer:
+    if settings.streaming_engine == "sherpa":
+        return SherpaRecognizer(settings)
+    if settings.streaming_engine == "parakeet":
+        return ParakeetRecognizer(settings)
+    raise ValueError(
+        f"SOFIA_STT_STREAMING_ENGINE must be sherpa or parakeet; got {settings.streaming_engine!r}"
+    )

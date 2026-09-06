@@ -11,7 +11,21 @@ services:
     build:
       args:
         TORCH_INDEX_URL: https://download.pytorch.org/whl/cu124
+        # Vulkan by default even here: the same parakeet.cpp build that runs
+        # on AMD runs unchanged on NVIDIA, so there is no reason to carry a
+        # second built artifact. Override to "cuda" to measure that backend
+        # instead (see docker/audio.Dockerfile and design.md D1 in
+        # openspec/changes/add-parakeet-streaming-asr) — not verified by an
+        # actual build in that change; ggml's CUDA backend needs nvcc at
+        # build time, which this Dockerfile's builder stage does not provide.
+        PARAKEET_BACKEND: ${PARAKEET_BACKEND:-vulkan}
     image: sofia-galileo/audio:cuda
+    # Vulkan device enumeration inside the container needs the "graphics"
+    # capability; the CUDA runtime alone (the implicit default under the
+    # nvidia driver) does not expose it, and a container with no visible
+    # Vulkan device silently falls back to CPU rather than erroring.
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: graphics,compute,utility
     deploy:
       resources:
         reservations:
