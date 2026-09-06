@@ -30,7 +30,8 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       # Exposed on loopback only — handy for `curl`, not meant for the network.
-      - "127.0.0.1:8000:8000"
+      # Override SOFIA_QAA_HOST_PORT in .env if 8000 is taken on the host.
+      - "127.0.0.1:${SOFIA_QAA_HOST_PORT:-8000}:8000"
     networks: [sofia]
 
   # ------------------------------------------------------------ speech to text
@@ -40,6 +41,7 @@ services:
       dockerfile: docker/audio.Dockerfile
       args:
         TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        WITH_ROCRAND_HEADERS: without-rocrand
     image: sofia-galileo/audio:${ACCEL:-cpu}
     command: ["sofia-stt"]
     restart: unless-stopped
@@ -58,6 +60,10 @@ services:
     volumes:
       - hf-cache:/home/sofia/.cache/huggingface
       - models:/home/sofia/models
+      # MIOpen (AMD) JIT-compiles kernels per tensor shape; persisting the cache
+      # means each shape costs seconds once per deployment, not per boot. The
+      # directory is simply unused on CPU/NVIDIA builds.
+      - miopen-cache:/home/sofia/.cache/miopen
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8100/healthz"]
       interval: 15s
@@ -65,6 +71,9 @@ services:
       # Generous: the first boot downloads model weights (~1.3 GB for Nemotron).
       start_period: 600s
       retries: 5
+    ports:
+      # Loopback only, for curl / the `task say` / `task ask` helpers.
+      - "127.0.0.1:8100:8100"
     networks: [sofia]
 
   # ------------------------------------------------------------ text to speech
@@ -74,6 +83,7 @@ services:
       dockerfile: docker/audio.Dockerfile
       args:
         TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        WITH_ROCRAND_HEADERS: without-rocrand
     image: sofia-galileo/audio:${ACCEL:-cpu}
     command: ["sofia-tts"]
     restart: unless-stopped
@@ -84,12 +94,16 @@ services:
       SOFIA_TTS_DEVICE: ${SOFIA_AUDIO_DEVICE:-auto}
     volumes:
       - hf-cache:/home/sofia/.cache/huggingface
+      - miopen-cache:/home/sofia/.cache/miopen
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8200/healthz"]
       interval: 15s
       timeout: 5s
       start_period: 300s
       retries: 5
+    ports:
+      # Loopback only, for curl / the `task say` helper.
+      - "127.0.0.1:8200:8200"
     networks: [sofia]
 
   # ------------------------------------------------------- the LiveKit worker
@@ -130,3 +144,4 @@ networks:
 volumes:
   hf-cache:
   models:
+  miopen-cache:

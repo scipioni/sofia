@@ -113,8 +113,8 @@ vendor. The images differ only in which PyTorch wheel index they install from:
 
 | Target | Overlay | Wheel index | Host requirement |
 |---|---|---|---|
-| NVIDIA | `compose.nvidia.yaml` | `…/whl/cu124` | NVIDIA Container Toolkit |
-| AMD | `compose.rocm.yaml` | `…/whl/rocm6.2` | ROCm kernel driver, `/dev/kfd` + `/dev/dri` |
+| NVIDIA | `compose.nvidia.yaml` | `…/whl/cu126` | NVIDIA Container Toolkit |
+| AMD | `compose.rocm.yaml` | `…/whl/rocm7.2` | ROCm kernel driver, `/dev/kfd` + `/dev/dri` |
 | CPU | *(none)* | `…/whl/cpu` | nothing |
 
 `s2s` and `qaa-agent` build once and run anywhere; they hold no weights.

@@ -17,6 +17,7 @@ from sofia_galileo.audio.batch import (
     MODEL_SAMPLE_RATE,
     build_transcriber,
     decode_audio,
+    match_model_dtype,
     to_locale,
 )
 from sofia_galileo.audio.config import SttSettings
@@ -85,6 +86,32 @@ def test_decode_rejects_garbage_with_a_useful_error() -> None:
 def test_unknown_engine_is_rejected_at_startup() -> None:
     with pytest.raises(ValueError, match="nemotron or whisper"):
         build_transcriber(SttSettings(batch_engine="parakeet"))
+
+
+class _FakeTensor:
+    def __init__(self, floating: bool) -> None:
+        self.floating = floating
+        self.casted_to: object | None = None
+
+    def is_floating_point(self) -> bool:
+        return self.floating
+
+    def to(self, dtype: object) -> _FakeTensor:
+        self.casted_to = dtype
+        return self
+
+
+def test_feature_dtype_matches_fp16_weights_but_ids_stay_integer() -> None:
+    """GPU profiles load fp16 weights; float32 features would crash the conv."""
+    inputs = {
+        "input_features": _FakeTensor(floating=True),
+        "prompt_ids": _FakeTensor(floating=False),
+        "language": "it-IT",  # non-tensor entries pass through
+    }
+    result = match_model_dtype(inputs, "float16")
+    assert result["input_features"].casted_to == "float16"
+    assert result["prompt_ids"].casted_to is None
+    assert result["language"] == "it-IT"
 
 
 def test_default_engine_is_nemotron() -> None:

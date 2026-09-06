@@ -18,16 +18,33 @@ services:
   stt: &rocm
     build:
       args:
-        TORCH_INDEX_URL: https://download.pytorch.org/whl/rocm6.2
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/rocm7.2
+        # MIOpen's JIT needs rocrand headers the torch wheel omits; take them
+        # from the host's matching /opt/rocm (see docker/audio.Dockerfile).
+        WITH_ROCRAND_HEADERS: with-rocrand
+      additional_contexts:
+        - rocm-ctx=/opt/rocm
     image: sofia-galileo/audio:rocm
     devices:
       - /dev/kfd
       - /dev/dri
     group_add:
-      - video
-      - render
+      # Numeric host GIDs (Arch here). Group *names* would resolve against the
+      # container's own /etc/group and miss the host's render group entirely.
+      - "989" # host: render
+      - "985" # host: video
     security_opt:
       - seccomp:unconfined
+    # ROCm's HSA runtime treats an *empty* HSA_OVERRIDE_GFX_VERSION as a broken
+    # override and hides the GPU — but compose always materialises `${VAR:-}`
+    # as an empty string. Strip it unless a real override was requested.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        [ -n "$$HSA_OVERRIDE_GFX_VERSION" ] || unset HSA_OVERRIDE_GFX_VERSION
+        exec "$$@"
+      - --
     # ROCm uses large shared-memory segments for its host/device transfers.
     ipc: host
     shm_size: "8gb"

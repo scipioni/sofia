@@ -18,12 +18,26 @@ import anyio.to_thread
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from sofia_galileo.audio.batch import build_transcriber
+from sofia_galileo.audio.batch import NemotronTranscriber, build_transcriber
 from sofia_galileo.audio.config import SttSettings
 from sofia_galileo.audio.realtime import serve_realtime
 from sofia_galileo.core.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
+
+
+def _tone_wav(seconds: float, sample_rate: int = 16000) -> bytes:
+    """A quiet 220 Hz tone as wav bytes — realistic input for kernel warm-up."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    t = np.linspace(0.0, seconds, int(seconds * sample_rate), endpoint=False)
+    tone = (0.05 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    buf = io.BytesIO()
+    sf.write(buf, tone, sample_rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
 
 
 @asynccontextmanager
@@ -33,7 +47,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.backend in ("batch", "both"):
         # Model load can block on a multi-gigabyte download; keep the loop free
         # so the healthcheck answers "loading" rather than timing out.
-        app.state.transcriber = await anyio.to_thread.run_sync(build_transcriber, settings)
+        transcriber = await anyio.to_thread.run_sync(build_transcriber, settings)
+        app.state.transcriber = transcriber
+        if isinstance(transcriber, NemotronTranscriber):
+            # Warm the conv kernels on the shapes of a typical short turn: MIOpen
+            # (AMD) JIT-compiles per input length, which would otherwise stall
+            # the first real transcription. Tone, not silence — silences take
+            # the padded fast path and compile nothing.
+            await anyio.to_thread.run_sync(transcriber.transcribe, _tone_wav(2.0), None)
     if settings.backend in ("streaming", "both"):
         from sofia_galileo.audio.streaming import SherpaRecognizer
 

@@ -6,11 +6,13 @@
 # Anything after `--` is passed through, e.g. `task test -- -k realtime -v`.
 version: "3"
 
+dotenv: [".env"]
+
 silent: true
 
 vars:
   COMPOSE: docker compose -f compose.yaml
-  QAA_URL: http://localhost:8000
+  QAA_URL: http://localhost:{{.SOFIA_QAA_HOST_PORT | default "8000"}}
   TTS_URL: http://localhost:8200
 
 tasks:

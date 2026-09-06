@@ -6,6 +6,7 @@ Bring your own OpenAI-compatible LLM. Everything else runs in four containers,
 on NVIDIA, AMD, or plain CPU.
 
 > Design rationale, measurements and production notes: **[docs/details.md](docs/details.md)**
+> Latency and throughput benchmarks on the reference AMD deployment: **[docs/benchmark.md](docs/benchmark.md)**
 
 ## Schema
 
@@ -92,7 +93,7 @@ synthesiser sentence by sentence.
 | `audio` | stt, tts | `transformers>=5.13`, `sherpa-onnx`, `kokoro`, `librosa`, `soundfile` |
 
 `torch` is deliberately *not* in `pyproject.toml`: the Dockerfile installs the
-`cu124`, `rocm6.2` or `cpu` wheel first, which is the only difference between
+`cu126`, `rocm7.2` or `cpu` wheel first, which is the only difference between
 GPU targets. System packages `ffmpeg`, `espeak-ng` and `libsndfile1` come from
 the audio image.
 

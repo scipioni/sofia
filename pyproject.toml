@@ -27,7 +27,7 @@ qaa = [
 ]
 
 # stt/tts services — the only GPU-bound part. torch is NOT listed here: the
-# Dockerfiles install the cu124 or rocm6.2 wheel explicitly before this extra.
+# Dockerfiles install the cu126, rocm7.2 or cpu wheel explicitly before this extra.
 audio = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",

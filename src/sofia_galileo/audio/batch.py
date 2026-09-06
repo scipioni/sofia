@@ -106,6 +106,22 @@ class BatchTranscriber(Protocol):
     def transcribe(self, raw: bytes, language: str | None) -> str: ...
 
 
+def match_model_dtype(inputs: Any, dtype: Any) -> Any:
+    """Cast floating-point feature tensors to *dtype*, leaving integer ids alone.
+
+    Processors always yield float32 audio features, but on a GPU the weights may
+    be fp16 and a conv would refuse the mix. Integer tensors (prompt token ids)
+    must stay integers — casting those would corrupt them. Non-tensor entries
+    (locale strings and friends) are passed through untouched.
+    """
+    for key, value in inputs.items():
+        if not hasattr(value, "is_floating_point"):
+            continue
+        if value.is_floating_point():
+            inputs[key] = value.to(dtype)
+    return inputs
+
+
 class NemotronTranscriber:
     """NVIDIA Nemotron 3.5 ASR, via plain transformers.
 
@@ -140,6 +156,7 @@ class NemotronTranscriber:
         inputs = self._processor(
             audio, sampling_rate=MODEL_SAMPLE_RATE, return_tensors="pt", language=locale
         ).to(self._device)
+        inputs = match_model_dtype(inputs, self._model.dtype)
         with torch.no_grad():
             output = self._model.generate(**inputs, max_new_tokens=self._max_new_tokens)
 

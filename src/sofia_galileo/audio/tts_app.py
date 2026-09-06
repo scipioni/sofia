@@ -51,6 +51,18 @@ class KokoroEngine:
     """Holds one Kokoro pipeline per language, built lazily on first use."""
 
     def __init__(self, settings: TtsSettings) -> None:
+        import torch
+
+        if torch.version.hip:
+            # MIOpen JIT-compiles its RNN kernels per sequence length, so every
+            # new sentence length stalls synthesis for 10-30 s while clang
+            # builds a shape-specific kernel — fatal for a voice agent, where
+            # no two replies have the same length. Kokoro's LSTMs are tiny and
+            # the plain PyTorch fallback matches MIOpen's warm throughput with
+            # no cliffs, so on ROCm we bypass it entirely. CUDA builds keep
+            # cuDNN: its kernels are precompiled and fast.
+            torch.backends.cudnn.enabled = False
+
         self._settings = settings
         self._device = resolve_device(settings.device)
         self._pipelines: dict[str, Any] = {}
@@ -100,11 +112,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: TtsSettings = app.state.settings
     engine = KokoroEngine(settings)
     app.state.engine = engine
-    # Warm the default voice so the first spoken reply is not the slow one.
-    await anyio.to_thread.run_sync(lambda: engine.synthesize("Hello.", settings.default_voice, 1.0))
+    # Warm the default voice at several utterance lengths: MIOpen (AMD) JIT-
+    # compiles LSTM kernels per sequence-length shape, and without this the
+    # first real reply of each new length stalls for 10+ seconds mid-call.
+    # Repeats and cached shapes cost milliseconds.
+    await anyio.to_thread.run_sync(_warm_up, engine, settings)
     log.info("tts.ready", port=settings.port, device=engine.device)
     yield
     app.state.engine = None
+
+
+def _warm_up(engine: KokoroEngine, settings: TtsSettings) -> None:
+    for sentence in (
+        "Hello.",
+        "This is a warm-up sentence of medium length for the synthesiser.",
+        "And this is a longer warm-up paragraph; it exists so that the GPU has "
+        "already compiled its kernels for the longer sentences a person will "
+        "hear during a real conversation, not just for short greetings.",
+    ):
+        engine.synthesize(sentence, settings.default_voice, 1.0)
 
 
 def create_app(settings: TtsSettings | None = None) -> FastAPI:
