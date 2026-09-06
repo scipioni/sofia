@@ -63,16 +63,36 @@ Consequences worth knowing before editing:
   `_accumulate_tool_calls`. When upstream fails the engine still speaks `UPSTREAM_ERROR_REPLY` —
   silence is the worst failure mode for a voice agent.
 - **`stt` serves two backends at once** (`SOFIA_STT_BACKEND=both`): batch Nemotron 3.5 over HTTP
-  (punctuated, 40 locales incl. Italian) and streaming sherpa-onnx over websocket (interim
-  transcripts, no Italian, no punctuation). s2s picks with `SOFIA_S2S_STT_USE_REALTIME`, so
-  switching is a restart, not a redeploy. Both run well on CPU. See
-  [docs/details.md](docs/details.md#streaming-vs-batch-asr) for the measured trade-off.
+  (punctuated, 40 locales incl. Italian) and streaming over websocket. Streaming itself has two
+  engines (`SOFIA_STT_STREAMING_ENGINE`): sherpa-onnx (no Italian, no punctuation, CPU-only) or
+  parakeet.cpp/ggml (same Nemotron weights as batch, so punctuated and covering Italian, but needs
+  a GPU-capable image — see below). s2s picks streaming vs batch with `SOFIA_S2S_STT_USE_REALTIME`,
+  so switching is a restart, not a redeploy. sherpa and batch run well on CPU; parakeet does not.
+  See [docs/details.md](docs/details.md#streaming-vs-batch-asr) for the measured trade-off.
 - **Turn latency is set by policy, not compute.** `SOFIA_STT_ENDPOINT_SILENCE` (0.8 s) dominates
-  once streaming ASR is on.
-- Audio code **never branches on GPU vendor**: ROCm PyTorch exposes the same `torch.cuda` API, so
-  `audio/config.py:resolve_device` covers both. The only NVIDIA/AMD/CPU difference is which torch
-  wheel index `docker/audio.Dockerfile` installs — hence `torch` is deliberately absent from
-  `pyproject.toml`.
+  once streaming ASR is on — true for both streaming engines: Nemotron has no end-of-utterance
+  signal of its own (that belongs only to the separate, English-only
+  `nvidia/parakeet_realtime_eou_120m-v1`), so the parakeet engine implements the same kind of
+  trailing-silence rule sherpa's own endpoint detection does, rather than a model signal.
+- **`tts` streams PCM by default.** `s2s`'s `tts_response_format` defaults to `pcm`:
+  `tts_app.py`'s `/v1/audio/speech` yields each Kokoro segment as soon as it's synthesized instead
+  of waiting for the whole reply, cutting time-to-first-audio by ~60% on long replies (see
+  docs/benchmark.md). `wav`/`flac` requests are unchanged — still a single flush, since a WAV
+  header must declare a total length that isn't known until synthesis finishes. `s2s` has its own
+  Dockerfile (`docker/s2s.Dockerfile`), separate from `tts`'s — rebuilding `tts` without rebuilding
+  `s2s` silently leaves this off.
+- **`tts`'s ROCm torch busy-spins one CPU core at idle** — a known, currently-open upstream ROCm
+  bug (the pip-bundled HSA runtime's `AsyncEventsLoop` background thread never sleeps after any GPU
+  op). `stt`, on the same runtime, doesn't show it. Fixed with `GPU_MAX_HW_QUEUES=1` on the `tts`
+  service in compose.yaml — an env var, not an application-code change; see docs/benchmark.md for
+  how it was diagnosed and confirmed.
+- Audio code **never branches on GPU vendor at the application-code level**: ROCm PyTorch exposes
+  the same `torch.cuda` API, so `audio/config.py:resolve_device` covers both. The only NVIDIA/AMD/
+  CPU difference is which torch wheel index `docker/audio.Dockerfile` installs — hence `torch` is
+  deliberately absent from `pyproject.toml`. The parakeet engine keeps this at the *build*, not
+  runtime, level too: `PARAKEET_BACKEND` picks a `cmake` flag (Vulkan by default — one build runs
+  unchanged on AMD and NVIDIA; `hip`/`cuda` are recognised but need a different builder base image
+  this Dockerfile does not provide), and the Python ctypes binding is identical regardless.
 
 ### Layout
 
