@@ -79,6 +79,15 @@ tasks:
   _up:
     internal: true
     cmds:
+      # models/hf-cache are host bind mounts (browseable, path set via
+      # SOFIA_MODELS_HOST_DIR / SOFIA_HF_CACHE_HOST_DIR in .env), not Docker
+      # volumes — Docker won't auto-chown a bind mount to the container's uid
+      # the way it does a freshly-created named volume, so a directory it
+      # auto-creates for a missing path comes back root-owned and the
+      # container's non-root user can't write into it. Doing it here once,
+      # up front, means every `task up:*` just works.
+      - mkdir -p "${SOFIA_MODELS_HOST_DIR:-./data/models}" "${SOFIA_HF_CACHE_HOST_DIR:-./data/hf-cache}"
+      - chmod -R a+rwX "${SOFIA_MODELS_HOST_DIR:-./data/models}" "${SOFIA_HF_CACHE_HOST_DIR:-./data/hf-cache}"
       - "{{.COMPOSE}} {{.OVERLAY}} up --build"
 
   down:

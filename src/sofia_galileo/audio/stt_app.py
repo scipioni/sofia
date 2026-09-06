@@ -56,11 +56,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # the padded fast path and compile nothing.
             await anyio.to_thread.run_sync(transcriber.transcribe, _tone_wav(2.0), None)
     if settings.backend in ("streaming", "both"):
-        from sofia_galileo.audio.streaming import SherpaRecognizer
+        from sofia_galileo.audio.streaming import build_recognizer
 
         # Loading blocks on a download the first time; keep the loop free so the
-        # healthcheck can still answer "loading" instead of timing out.
-        app.state.recognizer = await anyio.to_thread.run_sync(SherpaRecognizer, settings)
+        # healthcheck can still answer "loading" instead of timing out. A
+        # failure here (missing library, bad weights, unknown engine) propagates
+        # out of the lifespan context and the service does not come up — no
+        # silent fallback to a different recogniser than the one configured
+        # (design.md D8 in add-parakeet-streaming-asr).
+        app.state.recognizer = await anyio.to_thread.run_sync(build_recognizer, settings)
 
     log.info("stt.ready", port=settings.port, backend=settings.backend)
     yield

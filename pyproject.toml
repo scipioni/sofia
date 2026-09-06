@@ -40,6 +40,10 @@ audio = [
     "kokoro>=0.9",
     "soundfile>=0.12",
     "numpy>=1.26",
+    # Streaming (frame-by-frame) resampling for the parakeet.cpp path: its
+    # ResampleStream carries the filter delay line across calls, which a
+    # stateless per-frame resample would not (see streaming.py ParakeetSession).
+    "soxr>=0.4",
 ]
 
 dev = [

@@ -114,7 +114,12 @@ def test_feature_dtype_matches_fp16_weights_but_ids_stay_integer() -> None:
     assert result["language"] == "it-IT"
 
 
-def test_default_engine_is_nemotron() -> None:
-    settings = SttSettings()
+def test_default_engine_is_nemotron(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Check the class default, not whatever a developer's local .env sets
+    # SOFIA_STT_BATCH_ENGINE to — `task test`'s `dotenv: [".env"]` injects
+    # .env straight into the process environment, so _env_file=None alone
+    # would not be enough; the real variable itself has to go.
+    monkeypatch.delenv("SOFIA_STT_BATCH_ENGINE", raising=False)
+    settings = SttSettings(_env_file=None)
     assert settings.batch_engine == "nemotron"
     assert "nemotron" in settings.model_id

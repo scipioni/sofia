@@ -10,4 +10,5 @@ build/
 .ruff_cache/
 .mypy_cache/
 models/
+/data/
 *.wav

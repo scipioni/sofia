@@ -44,7 +44,7 @@ class SttSettings(BaseSettings):
 
     # batch | streaming | both
     backend: str = "both"
-    default_language: str = "en"
+    default_language: str = "it"
 
     # --- batch backend ---
     # nemotron: NVIDIA Nemotron 3.5 ASR (638M). Punctuated, cased, ~0.08 RTF on a
@@ -97,6 +97,39 @@ class SttSettings(BaseSettings):
     # and to the semantic turn detector is out-of-distribution for both.
     sherpa_normalize_case: bool = True
 
+    # --- streaming backend selection ---
+    # parakeet (default): Nemotron 3.5 ASR via parakeet.cpp/ggml — punctuated, cased,
+    # covers Italian, needs a GPU-capable image (see docker/audio.Dockerfile).
+    # sherpa: zipformer via sherpa-onnx, no Italian, no punctuation.
+    streaming_engine: str = "parakeet"
+
+    # --- parakeet.cpp (streaming) backend ---
+    # Resolved via the platform's normal shared-library search (ldconfig cache,
+    # LD_LIBRARY_PATH) unless given an absolute path; docker/audio.Dockerfile
+    # installs it to /usr/local/lib and runs ldconfig.
+    parakeet_library_path: str = "libparakeet.so"
+    # Pre-converted GGUF, validated at WER 0 against NeMo (mudler/parakeet-cpp-gguf).
+    # Fetched on first boot into the models volume, same as the sherpa release.
+    # q8_0 over f16: 33% smaller (939 MB vs 1.4 GB), marginally faster in
+    # steady state (RTF 0.104 vs 0.108 measured on the same clip), and
+    # indistinguishable transcript quality — see
+    # openspec/changes/add-parakeet-streaming-asr/tasks.md 7.2. That was one
+    # clip, not a WER corpus; point this at the f16 URL instead if broader
+    # testing says otherwise.
+    parakeet_model_url: str = (
+        "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/"
+        "nemotron-3.5-asr-streaming-0.6b-q8_0.gguf"
+    )
+    parakeet_model_path: Path = Path(
+        "/home/sofia/models/stt-streaming-parakeet/nemotron-3.5-asr-streaming-0.6b-q8_0.gguf"
+    )
+    # Nemotron has no end-of-utterance signal of its own — that capability
+    # belongs only to the separate, English-only nvidia/parakeet_realtime_eou_
+    # 120m-v1 model. ParakeetSession closes turns on its own trailing-silence
+    # rule instead, the same job sherpa_rule2/rule3 do for sherpa.
+    parakeet_endpoint_silence: float = 0.8  # seconds of trailing silence after speech
+    parakeet_min_utterance_length: float = 20.0  # hard cap on one utterance
+
 
 class TtsSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SOFIA_TTS_", env_file=".env", extra="ignore")
@@ -108,4 +141,9 @@ class TtsSettings(BaseSettings):
 
     device: str = "auto"  # auto | cuda | cpu
     default_voice: str = "af_heart"
-    sample_rate: int = 24000  # Kokoro's native rate; do not change
+    # Kokoro's native rate; do not change. Also must match
+    # livekit.plugins.openai.tts's hardcoded SAMPLE_RATE=24000/NUM_CHANNELS=1
+    # (see s2s/config.py's tts_response_format) — the pcm streaming path
+    # carries no in-band format metadata, so a mismatch decodes as silent
+    # noise, not an error.
+    sample_rate: int = 24000
