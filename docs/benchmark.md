@@ -281,6 +281,50 @@ runtimes' own transitive dependencies (`librocprofiler-register.so.0`, then
 `libfmt.so.12`) don't line up across distros — a real rabbit hole for no
 benefit once the single env var was confirmed to work instead.
 
+### Concurrent rooms: how much one shared GPU costs everyone else
+
+`stt` and `tts` each run as one async FastAPI process with blocking inference
+offloaded to a thread (`anyio.to_thread.run_sync`), so the event loop itself
+never blocks — but both share one GPU, and `s2s` spawns one process per
+LiveKit room job. The question this answers: what actually happens to
+per-turn latency once more than one conversation is live at once?
+
+Measured directly against the real `stt`/`tts` HTTP endpoints (bypassing
+LiveKit rooms entirely — no risk to production dispatch), firing N concurrent
+requests and timing each individually. STT: `POST /v1/audio/transcriptions`
+on a 7.8 s Italian clip. TTS: `POST /v1/audio/speech`, `response_format=pcm`,
+on a representative ~150-character Italian reply.
+
+| Concurrent requests | STT latency (baseline 0.34 s) | TTS latency (baseline 1.0 s) |
+|---|---|---|
+| 2 | 0.52 s (1.5×) | — |
+| 3 | 0.72 s (2.1×) | 1.65 s (1.65×) |
+| 6 | 1.98 s, uniform across all 6 (5.8×) | 1.6–3.8 s, staggered (up to 3.8×) |
+
+Both scale **sub-linearly**, not at the naive N× pure serialization would
+predict — CPU-bound work (audio decode/resample for STT, phonemization for
+TTS) overlaps across requests, while the GPU compute portion queues. At 6
+concurrent, STT settled into a uniform ~2 s for everyone; TTS showed visible
+queueing instead — some requests finished at ~1.6 s, others at ~3.8 s,
+consistent with GPU work items processing one at a time while later ones
+wait. Neither degraded into an error or wrong output: correctness was
+re-verified after each burst (a fresh transcription of the same clip still
+matched exactly), and all four containers stayed healthy throughout.
+
+Practical read: a few simultaneous conversations are fine; per-turn latency
+degrades noticeably starting around 3+ concurrent rooms and gets rough by 6.
+Treat that as this deployment's real capacity ceiling — not a hard failure
+mode, but a real one, tied to the single shared GPU rather than to `s2s` or
+the container architecture (which handles concurrent room dispatch and
+concurrent HTTP requests without issue).
+
+**Methodology note:** the first attempt at the 3-concurrent STT measurement
+produced a wild 5.6 s outlier — traced to an unrelated `docker buildx bake`
+from another concurrent session competing for host CPU at that exact moment,
+not this stack's own behavior. Confirmed via `ps aux` (two live `buildx bake`
+processes) and `uptime` (elevated load average); retested with the host
+otherwise idle and got the clean, reproducible numbers above.
+
 ## The MIOpen story (why the first TTS benchmark looked terrible)
 
 Before the fix, every *new* utterance length triggered a fresh MIOpen JIT
@@ -327,3 +371,8 @@ Measured after the fix: worst case for a previously-unseen sentence length is
 4. `SOFIA_STT_ENDPOINT_SILENCE` / `min_endpointing_delay` are already at sane
    floors (0.8 s ASR-side, 0.4 s agent-side); lowering them further trades
    interruption robustness for ~100 ms.
+5. **Multiple concurrent rooms** — see "Concurrent rooms" above: per-turn
+   latency degrades noticeably starting around 3+ simultaneous conversations
+   (single shared GPU). Scaling past that needs either a second GPU (a
+   second `stt`/`tts` pair behind a load balancer) or accepting degraded
+   latency under concurrent load — not something a config knob fixes.

@@ -33,9 +33,11 @@ task up:rocm      # or: task up:nvidia | task up:cpu
 
 First boot downloads model weights (~1.3 GB batch ASR, ~310 MB for sherpa or ~640 MB for parakeet streaming ASR,
 ~330 MB TTS) into `./data/` — the healthcheck allows ten minutes for this, it
-only happens once. Leave it running; `task up:*` stays attached to the logs.
+only happens once. `task up:*` runs detached (`up -d`) and returns once
+everything is scheduled; use `task logs -- <service>` to follow a service's
+logs, and `docker compose ps` / `docker ps` to check status.
 
-In another terminal, confirm everything is actually healthy:
+Confirm everything is actually healthy:
 
 ```bash
 docker compose ps

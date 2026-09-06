@@ -62,37 +62,37 @@ tasks:
     desc: Build and run the whole stack on an NVIDIA GPU
     cmds:
       - task: _up
-        vars: { OVERLAY: "-f compose.nvidia.yaml" }
+        vars: { OVERLAY: "-f compose.nvidia.yaml", VARIANT: "nvidia" }
 
   up:rocm:
     desc: Build and run the whole stack on an AMD GPU
     cmds:
       - task: _up
-        vars: { OVERLAY: "-f compose.rocm.yaml" }
+        vars: { OVERLAY: "-f compose.rocm.yaml", VARIANT: "rocm" }
 
   up:cpu:
     desc: Build and run on CPU (slower, but needs no GPU at all)
     cmds:
       - task: _up
-        vars: { OVERLAY: "" }
+        vars: { OVERLAY: "", VARIANT: "cpu" }
 
   up:rocm:dev:
     desc: Like up:rocm, but with compose.dev.yaml's bind-mount + hot reload
     cmds:
       - task: _up
-        vars: { OVERLAY: "-f compose.rocm.yaml -f compose.dev.yaml" }
+        vars: { OVERLAY: "-f compose.rocm.yaml -f compose.dev.yaml", VARIANT: "rocm-dev" }
 
   up:nvidia:dev:
     desc: Like up:nvidia, but with compose.dev.yaml's bind-mount + hot reload
     cmds:
       - task: _up
-        vars: { OVERLAY: "-f compose.nvidia.yaml -f compose.dev.yaml" }
+        vars: { OVERLAY: "-f compose.nvidia.yaml -f compose.dev.yaml", VARIANT: "nvidia-dev" }
 
   up:cpu:dev:
     desc: Like up:cpu, but with compose.dev.yaml's bind-mount + hot reload
     cmds:
       - task: _up
-        vars: { OVERLAY: "-f compose.dev.yaml" }
+        vars: { OVERLAY: "-f compose.dev.yaml", VARIANT: "cpu-dev" }
 
   _up:
     internal: true
@@ -113,7 +113,48 @@ tasks:
       # fail on every run after the first for exactly that reason.
       - mkdir -p "${SOFIA_MODELS_HOST_DIR:-./data/models}" "${SOFIA_HF_CACHE_HOST_DIR:-./data/hf-cache}"
       - chmod a+rwX "${SOFIA_MODELS_HOST_DIR:-./data/models}" "${SOFIA_HF_CACHE_HOST_DIR:-./data/hf-cache}"
-      - "{{.COMPOSE}} {{.OVERLAY}} up --build"
+      - task: _build
+        vars: { OVERLAY: "{{.OVERLAY}}", VARIANT: "{{.VARIANT}}" }
+      # No --build here: _build above already brought every image up to date
+      # (or skipped, if nothing relevant changed) and invoking the builder
+      # again here would pay its cache-lookup/export cost a second time for
+      # nothing. Plain `up` builds automatically only if an image is entirely
+      # missing, which never happens once _build has run.
+      #
+      # -d (detached): a foreground `up` never exits on its own — it just
+      # follows logs forever — which makes it easy to mistake for a stuck or
+      # stale process days later and kill it, taking the whole stack down
+      # with it (containers with restart:unless-stopped survive their own
+      # crash, but not their parent CLI being killed while still attached in
+      # this mode). Detached avoids that failure mode entirely; `task logs`
+      # still follows logs on demand.
+      - "{{.COMPOSE}} {{.OVERLAY}} up -d"
+
+  _build:
+    internal: true
+    vars:
+      # One marker per accelerator+dev combination — VARIANT, not OVERLAY, so
+      # the on-disk name doesn't need shell-escaping the "-f x.yaml" syntax.
+      MARKER: ".task/built-{{.VARIANT}}"
+    # Task considers itself up-to-date (and skips cmds) only if every status
+    # command exits 0. First: the marker from a previous successful build
+    # must exist. Second: nothing this build actually depends on may be newer
+    # than that marker — `find -newer` lists any such file; `grep -q .` turns
+    # "found at least one" into exit 0, and `!` flips that to failure (rebuild
+    # needed) while "found nothing" (truly unchanged) flips to success (skip).
+    # This is what makes `task up:rocm` a no-op against the builder entirely
+    # when only, say, docs or an unrelated compose overlay changed — not just
+    # a fast rebuild, no builder invocation at all.
+    status:
+      - test -f {{.MARKER}}
+      - >-
+        sh -c '! find docker compose.yaml compose.rocm.yaml compose.nvidia.yaml
+        compose.dev.yaml pyproject.toml uv.lock src -newer {{.MARKER}} -print -quit
+        | grep -q .'
+    cmds:
+      - mkdir -p .task
+      - "{{.COMPOSE}} {{.OVERLAY}} build"
+      - touch {{.MARKER}}
 
   down:
     desc: Stop everything

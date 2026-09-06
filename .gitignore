@@ -12,3 +12,4 @@ build/
 models/
 /data/
 *.wav
+/.task/
