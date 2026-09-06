@@ -162,21 +162,17 @@ consumer cards ROCm does not officially list, set `HSA_OVERRIDE_GFX_VERSION`
 ## Adding a tool
 
 Server-side tools live in `src/sofia_galileo/qaa/tools.py`. A tool is an async
-function that returns a string and never raises:
+function that returns a string and never raises — the signature and docstring
+*are* the JSON schema the model sees:
 
 ```python
-@registry.register(
-    name="lookup_booking",
-    description="Look up a booking by its reference number.",
-    parameters={
-        "type": "object",
-        "properties": {"reference": {"type": "string"}},
-        "required": ["reference"],
-    },
-)
 async def lookup_booking(reference: str) -> str:
+    """Look up a booking by its reference number."""
     ...
     return "Booked for two people on Friday at eight."
+
+def build_default_toolset() -> FunctionToolset:
+    return FunctionToolset([never_raises(lookup_booking)], timeout=TOOL_TIMEOUT_S)
 ```
 
 Keep the tool surface small. Every tool round is an extra round trip to the LLM
@@ -186,9 +182,10 @@ caps it at 3 for that reason.
 ## What the tests actually protect
 
 `tests/test_engine.py` drives the tool loop against a stub upstream served over
-real HTTP, because that loop — tool-call fragments arriving split across SSE
-chunks, ours-versus-theirs dispatch, round limits — is where the bodies are
-buried.
+real HTTP, because that loop's contract — streamed fragments, ours-versus-theirs
+dispatch, round limits — is where the bodies are buried. The loop itself is
+pydantic-ai's now (major-pinned); the tests pin the *wire behavior* that must
+survive framework upgrades.
 
 `tests/test_realtime_ws.py` checks the realtime websocket against a fake
 recogniser: the wire format is what actually breaks in integration (deltas must

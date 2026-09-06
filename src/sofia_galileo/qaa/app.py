@@ -32,7 +32,7 @@ from sofia_galileo.qaa.schemas import (
     ModelList,
     ToolCall,
 )
-from sofia_galileo.qaa.tools import build_default_registry
+from sofia_galileo.qaa.tools import build_default_toolset
 
 log = get_logger(__name__)
 
@@ -40,14 +40,14 @@ log = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: QaaSettings = app.state.settings
-    registry = build_default_registry()
-    app.state.engine = QaaEngine(settings, registry)
+    toolset = build_default_toolset()
+    app.state.engine = QaaEngine(settings, toolset)
     log.info(
         "qaa.started",
         llm_base_url=settings.llm_base_url,
         llm_model=settings.llm_model,
         served_model_name=settings.served_model_name,
-        tools=len(registry) if settings.tools_enabled else 0,
+        tools=len(toolset.tools) if settings.tools_enabled else 0,
     )
     try:
         yield

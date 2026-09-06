@@ -52,16 +52,23 @@ Preserve this when changing anything at a service boundary; a bespoke endpoint w
 
 Consequences worth knowing before editing:
 
-- **Tool calls go both ways.** Tools registered in `qaa/tools.py` run server-side inside the engine
+- **Tool calls go both ways.** Tools defined in `qaa/tools.py` run server-side inside the engine
   and are invisible to s2s. Tools declared by the caller (LiveKit `function_tool`s) are passed
-  through and handed back for the caller to execute — `qaa/engine.py` dispatches on ours-vs-theirs.
-  `SOFIA_QAA_MAX_TOOL_ROUNDS` caps the loop at 3, because each round is silence on the call.
+  through as an external toolset and handed back for the caller to execute. `SOFIA_QAA_MAX_TOOL_ROUNDS`
+  caps the loop at 3, because each round is silence on the call.
+- **The agent loop is pydantic-ai's, not ours** (`qaa/engine.py`, major-pinned). The framework owns
+  model requests, tool dispatch, streamed fragment folding, retries and the request budget; the
+  engine keeps only the protocol glue (OpenAI messages in, three stream events out) and the
+  voice-agent policies: the round cap (`UsageLimits`), the token ceiling (`max_tokens`, pinned to
+  the legacy wire field for vLLM/llama.cpp/Ollama), and the never-silent failure path. Keep it that
+  way — the facade (`TextDelta | ToolCallsDelta | Done`) is what contains framework churn inside one
+  container.
 - **Wire schemas are `extra="allow"`** (`qaa/schemas.py`). s2s adds `sofia_room` / `sofia_language`
   via `extra_body`; upstream LLMs ignore them. Don't tighten this.
 - **qaa-agent is stateless.** LiveKit resends full history each turn; there is no persistence layer.
 - **Streaming is the point of `qaa/engine.py`.** Text deltas are emitted the instant they arrive.
-  Tool-call fragments arrive split across SSE chunks and are folded by index in
-  `_accumulate_tool_calls`. When upstream fails the engine still speaks `UPSTREAM_ERROR_REPLY` —
+  The run uses `end_strategy='graceful'` so text-then-tool-call responses still speak the text *and*
+  run the tools. When upstream fails the engine still speaks `UPSTREAM_ERROR_REPLY` —
   silence is the worst failure mode for a voice agent.
 - **`stt` serves two backends at once** (`SOFIA_STT_BACKEND=both`): batch Nemotron 3.5 over HTTP
   (punctuated, 40 locales incl. Italian) and streaming over websocket. Streaming itself has two

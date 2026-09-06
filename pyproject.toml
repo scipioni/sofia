@@ -24,6 +24,11 @@ qaa = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "openai>=1.55",
+    # The agent loop lives here now (engine.py drives it instead of hand-rolling
+    # SSE/tool-call plumbing). Slim keeps the image lean; `openai` above is the
+    # provider extra. Major-pinned: the framework moves fast, and the engine
+    # facade keeps that churn a qaa-internal affair.
+    "pydantic-ai-slim[openai]>=2,<3",
 ]
 
 # stt/tts services — the only GPU-bound part. torch is NOT listed here: the
